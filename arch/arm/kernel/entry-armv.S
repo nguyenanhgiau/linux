@@ -252,31 +252,10 @@ __und_svc:
 #else
 	svc_entry
 #endif
-	@
-	@ call emulation code, which returns using r9 if it has emulated
-	@ the instruction, or the more conventional lr if we are to treat
-	@ this as a real undefined instruction
-	@
-	@  r0 - instruction
-	@
-#ifndef CONFIG_THUMB2_KERNEL
-	ldr	r0, [r4, #-4]
-#else
-	mov	r1, #2
-	ldrh	r0, [r4, #-2]			@ Thumb instruction at LR - 2
-	cmp	r0, #0xe800			@ 32-bit instruction if xx >= 0
-	blo	__und_svc_fault
-	ldrh	r9, [r4]			@ bottom 16 bits
-	add	r4, r4, #2
-	str	r4, [sp, #S_PC]
-	orr	r0, r9, r0, lsl #16
-#endif
-	badr	r9, __und_svc_finish
-	mov	r2, r4
-	bl	call_fpe
 
 	mov	r1, #4				@ PC correction to apply
-__und_svc_fault:
+ THUMB(	tst	r5, #PSR_T_BIT		)	@ exception taken in Thumb mode?
+ THUMB(	movne	r1, #2			)	@ if so, fix up PC correction
 	mov	r0, sp				@ struct pt_regs *regs
 	bl	__und_fault
 
@@ -617,11 +596,9 @@ call_fpe:
 	tstne	r0, #0x04000000			@ bit 26 set on both ARM and Thumb-2
 	reteq	lr
 	and	r8, r0, #0x00000f00		@ mask out CP number
- THUMB(	lsr	r8, r8, #8		)
 	mov	r7, #1
-	add	r6, r10, #TI_USED_CP
- ARM(	strb	r7, [r6, r8, lsr #8]	)	@ set appropriate used_cp[]
- THUMB(	strb	r7, [r6, r8]		)	@ set appropriate used_cp[]
+	add	r6, r10, r8, lsr #8		@ add used_cp[] array offset first
+	strb	r7, [r6, #TI_USED_CP]		@ set appropriate used_cp[]
 #ifdef CONFIG_IWMMXT
 	@ Test if we need to give access to iWMMXt coprocessors
 	ldr	r5, [r10, #TI_FLAGS]
@@ -630,7 +607,7 @@ call_fpe:
 	bcs	iwmmxt_task_enable
 #endif
  ARM(	add	pc, pc, r8, lsr #6	)
- THUMB(	lsl	r8, r8, #2		)
+ THUMB(	lsr	r8, r8, #6		)
  THUMB(	add	pc, r8			)
 	nop
 

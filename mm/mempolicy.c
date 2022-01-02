@@ -759,7 +759,8 @@ static int mbind_range(struct mm_struct *mm, unsigned long start,
 			((vmstart - vma->vm_start) >> PAGE_SHIFT);
 		prev = vma_merge(mm, prev, vmstart, vmend, vma->vm_flags,
 				 vma->anon_vma, vma->vm_file, pgoff,
-				 new_pol, vma->vm_userfaultfd_ctx);
+				 new_pol, vma->vm_userfaultfd_ctx,
+				 vma_get_anon_name(vma));
 		if (prev) {
 			vma = prev;
 			next = vma->vm_next;
@@ -2143,8 +2144,9 @@ alloc_pages_vma(gfp_t gfp, int order, struct vm_area_struct *vma,
 			 * memory as well.
 			 */
 			if (!page && (gfp & __GFP_DIRECT_RECLAIM))
-				page = __alloc_pages_node(hpage_node,
-						gfp | __GFP_NORETRY, order);
+				page = __alloc_pages_nodemask(gfp | __GFP_NORETRY,
+							order, hpage_node,
+							nmask);
 
 			goto out;
 		}

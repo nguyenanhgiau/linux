@@ -235,7 +235,7 @@ static int ufs_hisi_link_startup_pre_change(struct ufs_hba *hba)
 	ufshcd_writel(hba, reg, REG_AUTO_HIBERNATE_IDLE_TIMER);
 
 	/* Unipro PA_Local_TX_LCC_Enable */
-	ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x155E, 0x0), 0x0);
+	ufshcd_disable_host_tx_lcc(hba);
 	/* close Unipro VS_Mk2ExtnSupport */
 	ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0xD0AB, 0x0), 0x0);
 	ufshcd_dme_get(hba, UIC_ARG_MIB_SEL(0xD0AB, 0x0), &value);
@@ -478,24 +478,35 @@ static int ufs_hisi_init_common(struct ufs_hba *hba)
 	if (!host)
 		return -ENOMEM;
 
+	/*
+	 * Inline crypto is currently broken with ufs-hisi because the keyslots
+	 * overlap with the vendor-specific SYS CTRL registers -- and even if
+	 * software uses only non-overlapping keyslots, the kernel crashes when
+	 * programming a key or a UFS error occurs on the first encrypted I/O.
+	 */
+	hba->quirks |= UFSHCD_QUIRK_BROKEN_CRYPTO;
+
 	host->hba = hba;
 	ufshcd_set_variant(hba, host);
 
-	host->rst  = devm_reset_control_get(dev, "rst");
+	host->rst = devm_reset_control_get(dev, "rst");
 	if (IS_ERR(host->rst)) {
 		dev_err(dev, "%s: failed to get reset control\n", __func__);
-		return PTR_ERR(host->rst);
+		err = PTR_ERR(host->rst);
+		goto error;
 	}
 
 	ufs_hisi_set_pm_lvl(hba);
 
 	err = ufs_hisi_get_resource(host);
-	if (err) {
-		ufshcd_set_variant(hba, NULL);
-		return err;
-	}
+	if (err)
+		goto error;
 
 	return 0;
+
+error:
+	ufshcd_set_variant(hba, NULL);
+	return err;
 }
 
 static int ufs_hi3660_init(struct ufs_hba *hba)

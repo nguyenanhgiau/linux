@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * fs/f2fs/segment.h
  *
@@ -16,6 +16,7 @@
 #define DEF_MAX_RECLAIM_PREFREE_SEGMENTS	4096	/* 8GB in maximum */
 
 #define F2FS_MIN_SEGMENTS	9 /* SB + 2 (CP + SIT + NAT) + SSA + MAIN */
+#define F2FS_MIN_META_SEGMENTS	8 /* SB + 2 (CP + SIT + NAT) + SSA */
 
 /* L: Logical segment # in volume, R: Relative segment # in main area */
 #define GET_L2R_SEGNO(free_i, segno)	((segno) - (free_i)->start_segno)
@@ -88,11 +89,11 @@
 #define BLKS_PER_SEC(sbi)					\
 	((sbi)->segs_per_sec * (sbi)->blocks_per_seg)
 #define GET_SEC_FROM_SEG(sbi, segno)				\
-	((segno) / (sbi)->segs_per_sec)
+	(((segno) == -1) ? -1: (segno) / (sbi)->segs_per_sec)
 #define GET_SEG_FROM_SEC(sbi, secno)				\
 	((secno) * (sbi)->segs_per_sec)
 #define GET_ZONE_FROM_SEC(sbi, secno)				\
-	((secno) / (sbi)->secs_per_zone)
+	(((secno) == -1) ? -1: (secno) / (sbi)->secs_per_zone)
 #define GET_ZONE_FROM_SEG(sbi, segno)				\
 	GET_ZONE_FROM_SEC(sbi, GET_SEC_FROM_SEG(sbi, segno))
 
@@ -200,18 +201,6 @@ struct segment_allocation {
 	void (*allocate_segment)(struct f2fs_sb_info *, int, bool);
 };
 
-/*
- * this value is set in page as a private data which indicate that
- * the page is atomically written, and it is in inmem_pages list.
- */
-#define ATOMIC_WRITTEN_PAGE		((unsigned long)-1)
-#define DUMMY_WRITTEN_PAGE		((unsigned long)-2)
-
-#define IS_ATOMIC_WRITTEN_PAGE(page)			\
-		(page_private(page) == (unsigned long)ATOMIC_WRITTEN_PAGE)
-#define IS_DUMMY_WRITTEN_PAGE(page)			\
-		(page_private(page) == (unsigned long)DUMMY_WRITTEN_PAGE)
-
 #define MAX_SKIP_GC_COUNT			16
 
 struct inmem_pages {
@@ -313,6 +302,8 @@ struct sit_entry_set {
  */
 static inline struct curseg_info *CURSEG_I(struct f2fs_sb_info *sbi, int type)
 {
+	if (type == CURSEG_COLD_DATA_PINNED)
+		type = CURSEG_COLD_DATA;
 	return (struct curseg_info *)(SM_I(sbi)->curseg_array + type);
 }
 
@@ -617,8 +608,10 @@ static inline int utilization(struct f2fs_sb_info *sbi)
  *                     threashold,
  * F2FS_IPU_FSYNC - activated in fsync path only for high performance flash
  *                     storages. IPU will be triggered only if the # of dirty
- *                     pages over min_fsync_blocks.
- * F2FS_IPUT_DISABLE - disable IPU. (=default option)
+ *                     pages over min_fsync_blocks. (=default option)
+ * F2FS_IPU_ASYNC - do IPU given by asynchronous write requests.
+ * F2FS_IPU_NOCACHE - disable IPU bio cache.
+ * F2FS_IPUT_DISABLE - disable IPU. (=default option in LFS mode)
  */
 #define DEF_MIN_IPU_UTIL	70
 #define DEF_MIN_FSYNC_BLOCKS	8
@@ -633,6 +626,7 @@ enum {
 	F2FS_IPU_SSR_UTIL,
 	F2FS_IPU_FSYNC,
 	F2FS_IPU_ASYNC,
+	F2FS_IPU_NOCACHE,
 };
 
 static inline unsigned int curseg_segno(struct f2fs_sb_info *sbi,
@@ -763,7 +757,7 @@ static inline unsigned long long get_mtime(struct f2fs_sb_info *sbi,
 						bool base_time)
 {
 	struct sit_info *sit_i = SIT_I(sbi);
-	time64_t diff, now = ktime_get_real_seconds();
+	time64_t diff, now = ktime_get_boottime_seconds();
 
 	if (now >= sit_i->mounted_time)
 		return sit_i->elapsed_time + now - sit_i->mounted_time;

@@ -8,13 +8,14 @@
 #ifndef __ASSEMBLY__
 
 #include <asm/unistd.h>
-#include <uapi/linux/time.h>
 
 #include <asm/vdso/clocksource.h>
 
 #define __VDSO_USE_SYSCALL		ULLONG_MAX
 
 #define VDSO_HAS_CLOCK_GETRES		1
+
+#define VDSO_HAS_TIME			1
 
 static __always_inline
 int gettimeofday_fallback(struct __kernel_old_timeval *_tv,
@@ -85,11 +86,7 @@ static __always_inline u64 __arch_get_hw_counter(s32 clock_mode)
 	 */
 	isb();
 	asm volatile("mrs %0, cntvct_el0" : "=r" (res) :: "memory");
-	/*
-	 * This isb() is required to prevent that the seq lock is
-	 * speculated.#
-	 */
-	isb();
+	arch_counter_enforce_ordering(res);
 
 	return res;
 }

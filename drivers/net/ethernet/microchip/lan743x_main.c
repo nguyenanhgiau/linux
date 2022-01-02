@@ -156,9 +156,8 @@ static void lan743x_tx_isr(void *context, u32 int_sts, u32 flags)
 	struct lan743x_tx *tx = context;
 	struct lan743x_adapter *adapter = tx->adapter;
 	bool enable_flag = true;
-	u32 int_en = 0;
 
-	int_en = lan743x_csr_read(adapter, INT_EN_SET);
+	lan743x_csr_read(adapter, INT_EN_SET);
 	if (flags & LAN743X_VECTOR_FLAG_SOURCE_ENABLE_CLEAR) {
 		lan743x_csr_write(adapter, INT_EN_CLR,
 				  INT_BIT_DMA_TX_(tx->channel_number));
@@ -1631,10 +1630,9 @@ static int lan743x_tx_napi_poll(struct napi_struct *napi, int weight)
 	bool start_transmitter = false;
 	unsigned long irq_flags = 0;
 	u32 ioc_bit = 0;
-	u32 int_sts = 0;
 
 	ioc_bit = DMAC_INT_BIT_TX_IOC_(tx->channel_number);
-	int_sts = lan743x_csr_read(adapter, DMAC_INT_STS);
+	lan743x_csr_read(adapter, DMAC_INT_STS);
 	if (tx->vector_flags & LAN743X_VECTOR_FLAG_SOURCE_STATUS_W2C)
 		lan743x_csr_write(adapter, DMAC_INT_STS, ioc_bit);
 	spin_lock_irqsave(&tx->ring_lock, irq_flags);
@@ -1707,6 +1705,16 @@ static int lan743x_tx_ring_init(struct lan743x_tx *tx)
 	if (tx->ring_size & ~TX_CFG_B_TX_RING_LEN_MASK_) {
 		ret = -EINVAL;
 		goto cleanup;
+	}
+	if (dma_set_mask_and_coherent(&tx->adapter->pdev->dev,
+				      DMA_BIT_MASK(64))) {
+		if (dma_set_mask_and_coherent(&tx->adapter->pdev->dev,
+					      DMA_BIT_MASK(32))) {
+			dev_warn(&tx->adapter->pdev->dev,
+				 "lan743x_: No suitable DMA available\n");
+			ret = -ENOMEM;
+			goto cleanup;
+		}
 	}
 	ring_allocation_size = ALIGN(tx->ring_size *
 				     sizeof(struct lan743x_tx_descriptor),
@@ -1890,13 +1898,21 @@ static int lan743x_rx_next_index(struct lan743x_rx *rx, int index)
 	return ((++index) % rx->ring_size);
 }
 
-static struct sk_buff *lan743x_rx_allocate_skb(struct lan743x_rx *rx)
+static struct sk_buff *lan743x_rx_allocate_skb(struct lan743x_rx *rx, gfp_t gfp)
 {
 	int length = 0;
 
 	length = (LAN743X_MAX_FRAME_SIZE + ETH_HLEN + 4 + RX_HEAD_PADDING);
 	return __netdev_alloc_skb(rx->adapter->netdev,
-				  length, GFP_ATOMIC | GFP_DMA);
+				  length, gfp);
+}
+
+static void lan743x_rx_update_tail(struct lan743x_rx *rx, int index)
+{
+	/* update the tail once per 8 descriptors */
+	if ((index & 7) == 7)
+		lan743x_csr_write(rx->adapter, RX_TAIL(rx->channel_number),
+				  index);
 }
 
 static int lan743x_rx_init_ring_element(struct lan743x_rx *rx, int index,
@@ -1929,6 +1945,7 @@ static int lan743x_rx_init_ring_element(struct lan743x_rx *rx, int index,
 	descriptor->data0 = (RX_DESC_DATA0_OWN_ |
 			    (length & RX_DESC_DATA0_BUF_LENGTH_MASK_));
 	skb_reserve(buffer_info->skb, RX_HEAD_PADDING);
+	lan743x_rx_update_tail(rx, index);
 
 	return 0;
 }
@@ -1947,6 +1964,7 @@ static void lan743x_rx_reuse_ring_element(struct lan743x_rx *rx, int index)
 	descriptor->data0 = (RX_DESC_DATA0_OWN_ |
 			    ((buffer_info->buffer_length) &
 			    RX_DESC_DATA0_BUF_LENGTH_MASK_));
+	lan743x_rx_update_tail(rx, index);
 }
 
 static void lan743x_rx_release_ring_element(struct lan743x_rx *rx, int index)
@@ -2059,7 +2077,8 @@ static int lan743x_rx_process_packet(struct lan743x_rx *rx)
 			struct sk_buff *new_skb = NULL;
 			int packet_length;
 
-			new_skb = lan743x_rx_allocate_skb(rx);
+			new_skb = lan743x_rx_allocate_skb(rx,
+							  GFP_ATOMIC | GFP_DMA);
 			if (!new_skb) {
 				/* failed to allocate next skb.
 				 * Memory is very low.
@@ -2158,6 +2177,7 @@ static int lan743x_rx_napi_poll(struct napi_struct *napi, int weight)
 {
 	struct lan743x_rx *rx = container_of(napi, struct lan743x_rx, napi);
 	struct lan743x_adapter *adapter = rx->adapter;
+	int result = RX_PROCESS_RESULT_NOTHING_TO_DO;
 	u32 rx_tail_flags = 0;
 	int count;
 
@@ -2166,27 +2186,19 @@ static int lan743x_rx_napi_poll(struct napi_struct *napi, int weight)
 		lan743x_csr_write(adapter, DMAC_INT_STS,
 				  DMAC_INT_BIT_RXFRM_(rx->channel_number));
 	}
-	count = 0;
-	while (count < weight) {
-		int rx_process_result = lan743x_rx_process_packet(rx);
-
-		if (rx_process_result == RX_PROCESS_RESULT_PACKET_RECEIVED) {
-			count++;
-		} else if (rx_process_result ==
-			RX_PROCESS_RESULT_NOTHING_TO_DO) {
+	for (count = 0; count < weight; count++) {
+		result = lan743x_rx_process_packet(rx);
+		if (result == RX_PROCESS_RESULT_NOTHING_TO_DO)
 			break;
-		} else if (rx_process_result ==
-			RX_PROCESS_RESULT_PACKET_DROPPED) {
-			continue;
-		}
 	}
 	rx->frame_count += count;
-	if (count == weight)
-		goto done;
+	if (count == weight || result == RX_PROCESS_RESULT_PACKET_RECEIVED)
+		return weight;
 
 	if (!napi_complete_done(napi, count))
-		goto done;
+		return count;
 
+	/* re-arm interrupts, must write to rx tail on some chip variants */
 	if (rx->vector_flags & LAN743X_VECTOR_FLAG_VECTOR_ENABLE_AUTO_SET)
 		rx_tail_flags |= RX_TAIL_SET_TOP_INT_VEC_EN_;
 	if (rx->vector_flags & LAN743X_VECTOR_FLAG_SOURCE_ENABLE_AUTO_SET) {
@@ -2196,10 +2208,10 @@ static int lan743x_rx_napi_poll(struct napi_struct *napi, int weight)
 				  INT_BIT_DMA_RX_(rx->channel_number));
 	}
 
-	/* update RX_TAIL */
-	lan743x_csr_write(adapter, RX_TAIL(rx->channel_number),
-			  rx_tail_flags | rx->last_tail);
-done:
+	if (rx_tail_flags)
+		lan743x_csr_write(adapter, RX_TAIL(rx->channel_number),
+				  rx_tail_flags | rx->last_tail);
+
 	return count;
 }
 
@@ -2255,6 +2267,16 @@ static int lan743x_rx_ring_init(struct lan743x_rx *rx)
 		ret = -EINVAL;
 		goto cleanup;
 	}
+	if (dma_set_mask_and_coherent(&rx->adapter->pdev->dev,
+				      DMA_BIT_MASK(64))) {
+		if (dma_set_mask_and_coherent(&rx->adapter->pdev->dev,
+					      DMA_BIT_MASK(32))) {
+			dev_warn(&rx->adapter->pdev->dev,
+				 "lan743x_: No suitable DMA available\n");
+			ret = -ENOMEM;
+			goto cleanup;
+		}
+	}
 	ring_allocation_size = ALIGN(rx->ring_size *
 				     sizeof(struct lan743x_rx_descriptor),
 				     PAGE_SIZE);
@@ -2293,7 +2315,8 @@ static int lan743x_rx_ring_init(struct lan743x_rx *rx)
 
 	rx->last_head = 0;
 	for (index = 0; index < rx->ring_size; index++) {
-		struct sk_buff *new_skb = lan743x_rx_allocate_skb(rx);
+		struct sk_buff *new_skb = lan743x_rx_allocate_skb(rx,
+								   GFP_KERNEL);
 
 		ret = lan743x_rx_init_ring_element(rx, index, new_skb);
 		if (ret)
@@ -2344,7 +2367,7 @@ static int lan743x_rx_open(struct lan743x_rx *rx)
 
 	netif_napi_add(adapter->netdev,
 		       &rx->napi, lan743x_rx_napi_poll,
-		       rx->ring_size - 1);
+		       NAPI_POLL_WEIGHT);
 
 	lan743x_csr_write(adapter, DMAC_CMD,
 			  DMAC_CMD_RX_SWR_(rx->channel_number));
@@ -3000,6 +3023,8 @@ static int lan743x_pm_resume(struct device *dev)
 	if (ret) {
 		netif_err(adapter, probe, adapter->netdev,
 			  "lan743x_hardware_init returned %d\n", ret);
+		lan743x_pci_cleanup(adapter);
+		return ret;
 	}
 
 	/* open netdev when netdev is at running state while resume.

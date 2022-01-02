@@ -11,6 +11,7 @@
 #include <linux/nospec.h>
 
 #include <linux/kcov.h>
+#include <linux/scs.h>
 
 #include <asm/switch_to.h>
 #include <asm/tlb.h>
@@ -22,6 +23,12 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
+
+#undef CREATE_TRACE_POINTS
+#include <trace/hooks/dtask.h>
+
+#undef CREATE_TRACE_POINTS
+#include <trace/hooks/sched.h>
 
 /*
  * Export tracepoints that act as a bare tracehook (ie: have no trace event
@@ -35,6 +42,7 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_se_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_overutilized_tp);
 
 DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
+EXPORT_SYMBOL_GPL(runqueues);
 
 #ifdef CONFIG_SCHED_DEBUG
 /*
@@ -822,7 +830,7 @@ DEFINE_STATIC_KEY_FALSE(sched_uclamp_used);
 
 static inline unsigned int uclamp_bucket_id(unsigned int clamp_value)
 {
-	return clamp_value / UCLAMP_BUCKET_DELTA;
+	return min_t(unsigned int, clamp_value / UCLAMP_BUCKET_DELTA, UCLAMP_BUCKETS - 1);
 }
 
 static inline unsigned int uclamp_bucket_base_value(unsigned int clamp_value)
@@ -896,9 +904,10 @@ unsigned int uclamp_rq_max_value(struct rq *rq, enum uclamp_id clamp_id,
 static inline struct uclamp_se
 uclamp_tg_restrict(struct task_struct *p, enum uclamp_id clamp_id)
 {
+	/* Copy by value as we could modify it */
 	struct uclamp_se uc_req = p->uclamp_req[clamp_id];
 #ifdef CONFIG_UCLAMP_TASK_GROUP
-	struct uclamp_se uc_max;
+	unsigned int tg_min, tg_max, value;
 
 	/*
 	 * Tasks in autogroups or root task group will be
@@ -909,9 +918,11 @@ uclamp_tg_restrict(struct task_struct *p, enum uclamp_id clamp_id)
 	if (task_group(p) == &root_task_group)
 		return uc_req;
 
-	uc_max = task_group(p)->uclamp[clamp_id];
-	if (uc_req.value > uc_max.value || !uc_req.user_defined)
-		return uc_max;
+	tg_min = task_group(p)->uclamp[UCLAMP_MIN].value;
+	tg_max = task_group(p)->uclamp[UCLAMP_MAX].value;
+	value = uc_req.value;
+	value = clamp(value, tg_min, tg_max);
+	uclamp_se_set(&uc_req, value, false);
 #endif
 
 	return uc_req;
@@ -938,17 +949,17 @@ uclamp_eff_get(struct task_struct *p, enum uclamp_id clamp_id)
 	return uc_req;
 }
 
-unsigned int uclamp_eff_value(struct task_struct *p, enum uclamp_id clamp_id)
+unsigned long uclamp_eff_value(struct task_struct *p, enum uclamp_id clamp_id)
 {
 	struct uclamp_se uc_eff;
 
 	/* Task currently refcounted: use back-annotated (effective) value */
 	if (p->uclamp[clamp_id].active)
-		return p->uclamp[clamp_id].value;
+		return (unsigned long)p->uclamp[clamp_id].value;
 
 	uc_eff = uclamp_eff_get(p, clamp_id);
 
-	return uc_eff.value;
+	return (unsigned long)uc_eff.value;
 }
 
 /*
@@ -1109,9 +1120,27 @@ static inline void uclamp_rq_dec(struct rq *rq, struct task_struct *p)
 		uclamp_rq_dec_id(rq, p, clamp_id);
 }
 
-static inline void
-uclamp_update_active(struct task_struct *p, enum uclamp_id clamp_id)
+static inline void uclamp_rq_reinc_id(struct rq *rq, struct task_struct *p,
+				      enum uclamp_id clamp_id)
 {
+	if (!p->uclamp[clamp_id].active)
+		return;
+
+	uclamp_rq_dec_id(rq, p, clamp_id);
+	uclamp_rq_inc_id(rq, p, clamp_id);
+
+	/*
+	 * Make sure to clear the idle flag if we've transiently reached 0
+	 * active tasks on rq.
+	 */
+	if (clamp_id == UCLAMP_MAX && (rq->uclamp_flags & UCLAMP_FLAG_IDLE))
+		rq->uclamp_flags &= ~UCLAMP_FLAG_IDLE;
+}
+
+static inline void
+uclamp_update_active(struct task_struct *p)
+{
+	enum uclamp_id clamp_id;
 	struct rq_flags rf;
 	struct rq *rq;
 
@@ -1131,30 +1160,22 @@ uclamp_update_active(struct task_struct *p, enum uclamp_id clamp_id)
 	 * affecting a valid clamp bucket, the next time it's enqueued,
 	 * it will already see the updated clamp bucket value.
 	 */
-	if (p->uclamp[clamp_id].active) {
-		uclamp_rq_dec_id(rq, p, clamp_id);
-		uclamp_rq_inc_id(rq, p, clamp_id);
-	}
+	for_each_clamp_id(clamp_id)
+		uclamp_rq_reinc_id(rq, p, clamp_id);
 
 	task_rq_unlock(rq, p, &rf);
 }
 
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 static inline void
-uclamp_update_active_tasks(struct cgroup_subsys_state *css,
-			   unsigned int clamps)
+uclamp_update_active_tasks(struct cgroup_subsys_state *css)
 {
-	enum uclamp_id clamp_id;
 	struct css_task_iter it;
 	struct task_struct *p;
 
 	css_task_iter_start(css, 0, &it);
-	while ((p = css_task_iter_next(&it))) {
-		for_each_clamp_id(clamp_id) {
-			if ((0x1 << clamp_id) & clamps)
-				uclamp_update_active(p, clamp_id);
-		}
-	}
+	while ((p = css_task_iter_next(&it)))
+		uclamp_update_active(p);
 	css_task_iter_end(&it);
 }
 
@@ -1326,7 +1347,7 @@ static void __init init_uclamp_rq(struct rq *rq)
 		};
 	}
 
-	rq->uclamp_flags = 0;
+	rq->uclamp_flags = UCLAMP_FLAG_IDLE;
 }
 
 static void __init init_uclamp(void)
@@ -1382,6 +1403,8 @@ static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 
 	uclamp_rq_inc(rq, p);
 	p->sched_class->enqueue_task(rq, p, flags);
+
+	trace_android_rvh_enqueue_task(rq, p);
 }
 
 static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
@@ -1396,6 +1419,8 @@ static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 
 	uclamp_rq_dec(rq, p);
 	p->sched_class->dequeue_task(rq, p, flags);
+
+	trace_android_rvh_dequeue_task(rq, p);
 }
 
 void activate_task(struct rq *rq, struct task_struct *p, int flags)
@@ -2116,7 +2141,11 @@ static int select_fallback_rq(int cpu, struct task_struct *p)
 	int nid = cpu_to_node(cpu);
 	const struct cpumask *nodemask = NULL;
 	enum { cpuset, possible, fail } state = cpuset;
-	int dest_cpu;
+	int dest_cpu = -1;
+
+	trace_android_rvh_select_fallback_rq(cpu, p, &dest_cpu);
+	if (dest_cpu >= 0)
+		return dest_cpu;
 
 	/*
 	 * If the node that the CPU is on has been offlined, cpu_to_node()
@@ -2471,6 +2500,9 @@ out:
 
 bool cpus_share_cache(int this_cpu, int that_cpu)
 {
+	if (this_cpu == that_cpu)
+		return true;
+
 	return per_cpu(sd_llc_id, this_cpu) == per_cpu(sd_llc_id, that_cpu);
 }
 #endif /* CONFIG_SMP */
@@ -2936,6 +2968,7 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	 * Make sure we do not leak PI boosting priority to the child.
 	 */
 	p->prio = current->normal_prio;
+	trace_android_rvh_prepare_prio_fork(p);
 
 	uclamp_fork(p);
 
@@ -2968,6 +3001,7 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 		p->sched_class = &fair_sched_class;
 
 	init_entity_runnable_average(&p->se);
+	trace_android_rvh_finish_prio_fork(p);
 
 	/*
 	 * The child is not yet in the pid-hash so no cgroup attach races,
@@ -3696,6 +3730,8 @@ void scheduler_tick(void)
 	rq->idle_balance = idle_cpu(cpu);
 	trigger_load_balance(rq);
 #endif
+
+	trace_android_vh_scheduler_tick(rq);
 }
 
 #ifdef CONFIG_NO_HZ_FULL
@@ -4466,6 +4502,7 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	struct rq_flags rf;
 	struct rq *rq;
 
+	trace_android_rvh_rtmutex_prepare_setprio(p, pi_task);
 	/* XXX used to be waiter->prio, not waiter->task->prio */
 	prio = __rt_effective_prio(pi_task, p->normal_prio);
 
@@ -4584,12 +4621,13 @@ static inline int rt_effective_prio(struct task_struct *p, int prio)
 
 void set_user_nice(struct task_struct *p, long nice)
 {
-	bool queued, running;
+	bool queued, running, allowed = false;
 	int old_prio, delta;
 	struct rq_flags rf;
 	struct rq *rq;
 
-	if (task_nice(p) == nice || nice < MIN_NICE || nice > MAX_NICE)
+	trace_android_rvh_set_user_nice(p, &nice, &allowed);
+	if ((task_nice(p) == nice || nice < MIN_NICE || nice > MAX_NICE) && !allowed)
 		return;
 	/*
 	 * We have to be careful, if called from sys_setpriority(),
@@ -4820,6 +4858,8 @@ static void __setscheduler(struct rq *rq, struct task_struct *p,
 		p->sched_class = &rt_sched_class;
 	else
 		p->sched_class = &fair_sched_class;
+
+	trace_android_rvh_setscheduler(p);
 }
 
 /*
@@ -4948,9 +4988,6 @@ recheck:
 			return retval;
 	}
 
-	if (pi)
-		cpuset_read_lock();
-
 	/*
 	 * Make sure no PI-waiters arrive (or leave) while we are
 	 * changing the priority of the task:
@@ -5025,8 +5062,6 @@ change:
 	if (unlikely(oldpolicy != -1 && oldpolicy != p->policy)) {
 		policy = oldpolicy = -1;
 		task_rq_unlock(rq, p, &rf);
-		if (pi)
-			cpuset_read_unlock();
 		goto recheck;
 	}
 
@@ -5087,10 +5122,8 @@ change:
 	preempt_disable();
 	task_rq_unlock(rq, p, &rf);
 
-	if (pi) {
-		cpuset_read_unlock();
+	if (pi)
 		rt_mutex_adjust_pi(p);
-	}
 
 	/* Run balance callbacks after we've adjusted the PI chain: */
 	balance_callback(rq);
@@ -5100,8 +5133,6 @@ change:
 
 unlock:
 	task_rq_unlock(rq, p, &rf);
-	if (pi)
-		cpuset_read_unlock();
 	return retval;
 }
 
@@ -5150,6 +5181,7 @@ int sched_setattr_nocheck(struct task_struct *p, const struct sched_attr *attr)
 {
 	return __sched_setscheduler(p, attr, false, true);
 }
+EXPORT_SYMBOL_GPL(sched_setattr_nocheck);
 
 /**
  * sched_setscheduler_nocheck - change the scheduling policy and/or RT priority of a thread from kernelspace.
@@ -5186,14 +5218,9 @@ do_sched_setscheduler(pid_t pid, int policy, struct sched_param __user *param)
 	rcu_read_lock();
 	retval = -ESRCH;
 	p = find_process_by_pid(pid);
-	if (likely(p))
-		get_task_struct(p);
-	rcu_read_unlock();
-
-	if (likely(p)) {
+	if (p != NULL)
 		retval = sched_setscheduler(p, policy, &lparam);
-		put_task_struct(p);
-	}
+	rcu_read_unlock();
 
 	return retval;
 }
@@ -5679,12 +5706,8 @@ static void do_sched_yield(void)
 	schedstat_inc(rq->yld_count);
 	current->sched_class->yield_task(rq);
 
-	/*
-	 * Since we are going to call schedule() anyway, there's
-	 * no need to preempt or enable interrupts:
-	 */
 	preempt_disable();
-	rq_unlock(rq, &rf);
+	rq_unlock_irq(rq, &rf);
 	sched_preempt_enable_no_resched();
 
 	schedule();
@@ -6032,6 +6055,7 @@ void sched_show_task(struct task_struct *p)
 		(unsigned long)task_thread_info(p)->flags);
 
 	print_worker_info(KERN_INFO, p);
+	trace_android_vh_sched_show_task(p);
 	show_stack(p, NULL);
 	put_task_stack(p);
 }
@@ -6119,6 +6143,7 @@ void init_idle(struct task_struct *idle, int cpu)
 	idle->se.exec_start = sched_clock();
 	idle->flags |= PF_IDLE;
 
+	scs_task_reset(idle);
 	kasan_unpoison_task_stack(idle);
 
 #ifdef CONFIG_SMP
@@ -7192,7 +7217,11 @@ static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
 
 #ifdef CONFIG_UCLAMP_TASK_GROUP
 	/* Propagate the effective uclamp value for the new group */
+	mutex_lock(&uclamp_mutex);
+	rcu_read_lock();
 	cpu_util_update_eff(css);
+	rcu_read_unlock();
+	mutex_unlock(&uclamp_mutex);
 #endif
 
 	return 0;
@@ -7282,6 +7311,9 @@ static void cpu_util_update_eff(struct cgroup_subsys_state *css)
 	enum uclamp_id clamp_id;
 	unsigned int clamps;
 
+	lockdep_assert_held(&uclamp_mutex);
+	SCHED_WARN_ON(!rcu_read_lock_held());
+
 	css_for_each_descendant_pre(css, top_css) {
 		uc_parent = css_tg(css)->parent
 			? css_tg(css)->parent->uclamp : NULL;
@@ -7314,7 +7346,7 @@ static void cpu_util_update_eff(struct cgroup_subsys_state *css)
 		}
 
 		/* Immediately update descendants RUNNABLE tasks */
-		uclamp_update_active_tasks(css, clamps);
+		uclamp_update_active_tasks(css);
 	}
 }
 
@@ -7443,6 +7475,27 @@ static int cpu_uclamp_max_show(struct seq_file *sf, void *v)
 {
 	cpu_uclamp_print(sf, UCLAMP_MAX);
 	return 0;
+}
+
+static int cpu_uclamp_ls_write_u64(struct cgroup_subsys_state *css,
+				   struct cftype *cftype, u64 ls)
+{
+	struct task_group *tg;
+
+	if (ls > 1)
+		return -EINVAL;
+	tg = css_tg(css);
+	tg->latency_sensitive = (unsigned int) ls;
+
+	return 0;
+}
+
+static u64 cpu_uclamp_ls_read_u64(struct cgroup_subsys_state *css,
+				  struct cftype *cft)
+{
+	struct task_group *tg = css_tg(css);
+
+	return (u64) tg->latency_sensitive;
 }
 #endif /* CONFIG_UCLAMP_TASK_GROUP */
 
@@ -7812,6 +7865,12 @@ static struct cftype cpu_legacy_files[] = {
 		.seq_show = cpu_uclamp_max_show,
 		.write = cpu_uclamp_max_write,
 	},
+	{
+		.name = "uclamp.latency_sensitive",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_u64 = cpu_uclamp_ls_read_u64,
+		.write_u64 = cpu_uclamp_ls_write_u64,
+	},
 #endif
 	{ }	/* Terminate */
 };
@@ -7992,6 +8051,12 @@ static struct cftype cpu_files[] = {
 		.flags = CFTYPE_NOT_ON_ROOT,
 		.seq_show = cpu_uclamp_max_show,
 		.write = cpu_uclamp_max_write,
+	},
+	{
+		.name = "uclamp.latency_sensitive",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_u64 = cpu_uclamp_ls_read_u64,
+		.write_u64 = cpu_uclamp_ls_write_u64,
 	},
 #endif
 	{ }	/* terminate */

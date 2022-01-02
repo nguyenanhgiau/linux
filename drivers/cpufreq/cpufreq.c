@@ -16,6 +16,7 @@
 
 #include <linux/cpu.h>
 #include <linux/cpufreq.h>
+#include <linux/cpufreq_times.h>
 #include <linux/cpu_cooling.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -105,6 +106,8 @@ bool have_governor_per_policy(void)
 }
 EXPORT_SYMBOL_GPL(have_governor_per_policy);
 
+static struct kobject *cpufreq_global_kobject;
+
 struct kobject *get_governor_parent_kobj(struct cpufreq_policy *policy)
 {
 	if (have_governor_per_policy())
@@ -154,6 +157,12 @@ __weak void arch_set_freq_scale(struct cpumask *cpus, unsigned long cur_freq,
 {
 }
 EXPORT_SYMBOL_GPL(arch_set_freq_scale);
+
+__weak void arch_set_max_freq_scale(struct cpumask *cpus,
+				    unsigned long policy_max_freq)
+{
+}
+EXPORT_SYMBOL_GPL(arch_set_max_freq_scale);
 
 /*
  * This is a generic cpufreq init() routine which can be used by cpufreq
@@ -382,6 +391,7 @@ static void cpufreq_notify_transition(struct cpufreq_policy *policy,
 					 CPUFREQ_POSTCHANGE, freqs);
 
 		cpufreq_stats_record_transition(policy, freqs->new);
+		cpufreq_times_record_transition(policy, freqs->new);
 		policy->cur = freqs->new;
 	}
 }
@@ -995,10 +1005,9 @@ static struct kobj_type ktype_cpufreq = {
 	.release	= cpufreq_sysfs_release,
 };
 
-static void add_cpu_dev_symlink(struct cpufreq_policy *policy, unsigned int cpu)
+static void add_cpu_dev_symlink(struct cpufreq_policy *policy, unsigned int cpu,
+				struct device *dev)
 {
-	struct device *dev = get_cpu_device(cpu);
-
 	if (unlikely(!dev))
 		return;
 
@@ -1361,9 +1370,14 @@ static int cpufreq_online(unsigned int cpu)
 			goto out_free_policy;
 		}
 
+		/*
+		 * The initialization has succeeded and the policy is online.
+		 * If there is a problem with its frequency table, take it
+		 * offline and drop it.
+		 */
 		ret = cpufreq_table_validate_and_sort(policy);
 		if (ret)
-			goto out_exit_policy;
+			goto out_offline_policy;
 
 		/* related_cpus should at least include policy->cpus. */
 		cpumask_copy(policy->related_cpus, policy->cpus);
@@ -1379,7 +1393,7 @@ static int cpufreq_online(unsigned int cpu)
 	if (new_policy) {
 		for_each_cpu(j, policy->related_cpus) {
 			per_cpu(cpufreq_cpu_data, j) = policy;
-			add_cpu_dev_symlink(policy, j);
+			add_cpu_dev_symlink(policy, j, get_cpu_device(j));
 		}
 
 		policy->min_freq_req = kzalloc(2 * sizeof(*policy->min_freq_req),
@@ -1473,6 +1487,7 @@ static int cpufreq_online(unsigned int cpu)
 			goto out_destroy_policy;
 
 		cpufreq_stats_create_table(policy);
+		cpufreq_times_create_policy(policy);
 
 		write_lock_irqsave(&cpufreq_driver_lock, flags);
 		list_add(&policy->policy_list, &cpufreq_policy_list);
@@ -1507,6 +1522,10 @@ out_destroy_policy:
 
 	up_write(&policy->rwsem);
 
+out_offline_policy:
+	if (cpufreq_driver->offline)
+		cpufreq_driver->offline(policy);
+
 out_exit_policy:
 	if (cpufreq_driver->exit)
 		cpufreq_driver->exit(policy);
@@ -1538,7 +1557,7 @@ static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
 	/* Create sysfs link on CPU registration */
 	policy = per_cpu(cpufreq_cpu_data, cpu);
 	if (policy)
-		add_cpu_dev_symlink(policy, cpu);
+		add_cpu_dev_symlink(policy, cpu, dev);
 
 	return 0;
 }
@@ -2033,9 +2052,15 @@ EXPORT_SYMBOL(cpufreq_unregister_notifier);
 unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
 					unsigned int target_freq)
 {
+	int ret;
+
 	target_freq = clamp_val(target_freq, policy->min, policy->max);
 
-	return cpufreq_driver->fast_switch(policy, target_freq);
+	ret = cpufreq_driver->fast_switch(policy, target_freq);
+	if (ret)
+		cpufreq_times_record_transition(policy, ret);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(cpufreq_driver_fast_switch);
 
@@ -2413,6 +2438,8 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 	policy->max = new_data.max;
 	trace_cpu_frequency_limits(policy);
 
+	arch_set_max_freq_scale(policy->cpus, policy->max);
+
 	policy->cached_target_freq = UINT_MAX;
 
 	pr_debug("new min and max freqs are %u - %u kHz\n",
@@ -2759,9 +2786,6 @@ int cpufreq_unregister_driver(struct cpufreq_driver *driver)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(cpufreq_unregister_driver);
-
-struct kobject *cpufreq_global_kobject;
-EXPORT_SYMBOL(cpufreq_global_kobject);
 
 static int __init cpufreq_core_init(void)
 {

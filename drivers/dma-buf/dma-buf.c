@@ -76,16 +76,29 @@ static void dma_buf_release(struct dentry *dentry)
 
 	dmabuf->ops->release(dmabuf);
 
+	if (dmabuf->resv == (struct dma_resv *)&dmabuf[1])
+		dma_resv_fini(dmabuf->resv);
+
+	WARN_ON(!list_empty(&dmabuf->attachments));
+	module_put(dmabuf->owner);
+	kfree(dmabuf->name);
+	kfree(dmabuf);
+}
+
+static int dma_buf_file_release(struct inode *inode, struct file *file)
+{
+	struct dma_buf *dmabuf;
+
+	if (!is_dma_buf_file(file))
+		return -EINVAL;
+
+	dmabuf = file->private_data;
+
 	mutex_lock(&db_list.lock);
 	list_del(&dmabuf->list_node);
 	mutex_unlock(&db_list.lock);
 
-	if (dmabuf->resv == (struct dma_resv *)&dmabuf[1])
-		dma_resv_fini(dmabuf->resv);
-
-	module_put(dmabuf->owner);
-	kfree(dmabuf->name);
-	kfree(dmabuf);
+	return 0;
 }
 
 static const struct dentry_operations dma_buf_dentry_ops = {
@@ -413,6 +426,7 @@ static void dma_buf_show_fdinfo(struct seq_file *m, struct file *file)
 }
 
 static const struct file_operations dma_buf_fops = {
+	.release	= dma_buf_file_release,
 	.mmap		= dma_buf_mmap_internal,
 	.llseek		= dma_buf_llseek,
 	.poll		= dma_buf_poll,
@@ -960,6 +974,30 @@ int dma_buf_begin_cpu_access(struct dma_buf *dmabuf,
 }
 EXPORT_SYMBOL_GPL(dma_buf_begin_cpu_access);
 
+int dma_buf_begin_cpu_access_partial(struct dma_buf *dmabuf,
+				     enum dma_data_direction direction,
+				     unsigned int offset, unsigned int len)
+{
+	int ret = 0;
+
+	if (WARN_ON(!dmabuf))
+		return -EINVAL;
+
+	if (dmabuf->ops->begin_cpu_access_partial)
+		ret = dmabuf->ops->begin_cpu_access_partial(dmabuf, direction,
+							    offset, len);
+
+	/* Ensure that all fences are waited upon - but we first allow
+	 * the native handler the chance to do so more efficiently if it
+	 * chooses. A double invocation here will be reasonably cheap no-op.
+	 */
+	if (ret == 0)
+		ret = __dma_buf_begin_cpu_access(dmabuf, direction);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(dma_buf_begin_cpu_access_partial);
+
 /**
  * dma_buf_end_cpu_access - Must be called after accessing a dma_buf from the
  * cpu in the kernel context. Calls end_cpu_access to allow exporter-specific
@@ -985,6 +1023,22 @@ int dma_buf_end_cpu_access(struct dma_buf *dmabuf,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(dma_buf_end_cpu_access);
+
+int dma_buf_end_cpu_access_partial(struct dma_buf *dmabuf,
+				   enum dma_data_direction direction,
+				   unsigned int offset, unsigned int len)
+{
+	int ret = 0;
+
+	WARN_ON(!dmabuf);
+
+	if (dmabuf->ops->end_cpu_access_partial)
+		ret = dmabuf->ops->end_cpu_access_partial(dmabuf, direction,
+							  offset, len);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(dma_buf_end_cpu_access_partial);
 
 /**
  * dma_buf_kmap - Map a page of the buffer object into kernel address space. The
@@ -1150,6 +1204,32 @@ void dma_buf_vunmap(struct dma_buf *dmabuf, void *vaddr)
 	mutex_unlock(&dmabuf->lock);
 }
 EXPORT_SYMBOL_GPL(dma_buf_vunmap);
+
+int dma_buf_get_flags(struct dma_buf *dmabuf, unsigned long *flags)
+{
+	int ret = 0;
+
+	if (WARN_ON(!dmabuf) || !flags)
+		return -EINVAL;
+
+	if (dmabuf->ops->get_flags)
+		ret = dmabuf->ops->get_flags(dmabuf, flags);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(dma_buf_get_flags);
+
+int dma_buf_get_uuid(struct dma_buf *dmabuf, uuid_t *uuid)
+{
+	if (WARN_ON(!dmabuf) || !uuid)
+		return -EINVAL;
+
+	if (!dmabuf->ops->get_uuid)
+		return -ENODEV;
+
+	return dmabuf->ops->get_uuid(dmabuf, uuid);
+}
+EXPORT_SYMBOL_GPL(dma_buf_get_uuid);
 
 #ifdef CONFIG_DEBUG_FS
 static int dma_buf_debug_show(struct seq_file *s, void *unused)

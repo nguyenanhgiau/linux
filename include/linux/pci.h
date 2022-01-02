@@ -41,6 +41,7 @@
 #include <uapi/linux/pci.h>
 
 #include <linux/pci_ids.h>
+#include <linux/android_kabi.h>
 
 /*
  * The PCI interface treats multi-function devices as independent
@@ -208,6 +209,8 @@ enum pci_dev_flags {
 	PCI_DEV_FLAGS_NO_FLR_RESET = (__force pci_dev_flags_t) (1 << 10),
 	/* Don't use Relaxed Ordering for TLPs directed at this device */
 	PCI_DEV_FLAGS_NO_RELAXED_ORDERING = (__force pci_dev_flags_t) (1 << 11),
+	/* Device does honor MSI masking despite saying otherwise */
+	PCI_DEV_FLAGS_HAS_MSI_MASKING = (__force pci_dev_flags_t) (1 << 12),
 };
 
 enum pci_irq_reroute_variant {
@@ -423,7 +426,6 @@ struct pci_dev {
 	unsigned int	is_probed:1;		/* Device probing in progress */
 	unsigned int	link_active_reporting:1;/* Device capable of reporting link active */
 	unsigned int	no_vf_scan:1;		/* Don't scan for VFs after IOV enablement */
-	unsigned int	no_command_memory:1;	/* No PCI_COMMAND_MEMORY */
 	pci_dev_flags_t dev_flags;
 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
 
@@ -469,6 +471,11 @@ struct pci_dev {
 	char		*driver_override; /* Driver name to force a match */
 
 	unsigned long	priv_flags;	/* Private flags for the PCI driver */
+
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
+	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_RESERVE(4);
 };
 
 static inline struct pci_dev *pci_physfn(struct pci_dev *dev)
@@ -602,6 +609,11 @@ struct pci_bus {
 	struct bin_attribute	*legacy_io;	/* Legacy I/O for this bus */
 	struct bin_attribute	*legacy_mem;	/* Legacy mem */
 	unsigned int		is_added:1;
+
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
+	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_RESERVE(4);
 };
 
 #define to_pci_bus(n)	container_of(n, struct pci_bus, dev)
@@ -839,6 +851,11 @@ struct pci_driver {
 	const struct attribute_group **groups;
 	struct device_driver	driver;
 	struct pci_dynids	dynids;
+
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
+	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_RESERVE(4);
 };
 
 #define	to_pci_driver(drv) container_of(drv, struct pci_driver, driver)
@@ -1688,8 +1705,9 @@ static inline int pci_enable_device(struct pci_dev *dev) { return -EIO; }
 static inline void pci_disable_device(struct pci_dev *dev) { }
 static inline int pci_assign_resource(struct pci_dev *dev, int i)
 { return -EBUSY; }
-static inline int __pci_register_driver(struct pci_driver *drv,
-					struct module *owner)
+static inline int __must_check __pci_register_driver(struct pci_driver *drv,
+						     struct module *owner,
+						     const char *mod_name)
 { return 0; }
 static inline int pci_register_driver(struct pci_driver *drv)
 { return 0; }
